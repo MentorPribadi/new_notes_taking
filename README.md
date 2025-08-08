@@ -1,4 +1,4 @@
-# Note taking app
+# Note taking app new
 
 *Automatically synced with your [v0.dev](https://v0.dev) deployments*
 

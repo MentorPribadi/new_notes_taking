@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Archive, Brain, ChevronDown, ChevronUp, CornerDownLeft, FilePlus2, MoreVertical, Pin, PinOff, Search, Settings, Trash2, MessageSquare, LogOut, User2, Tag } from 'lucide-react'
+import { Archive, Brain, ChevronDown, ChevronUp, CornerDownLeft, FilePlus2, MoreVertical, Pin, PinOff, Search, Settings, Trash2, MessageSquare, LogIn, LogOut, User2, Tag } from 'lucide-react'
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -52,7 +52,6 @@ type SortKey = "updatedAt" | "createdAt" | "title"
 const STORAGE_KEY = "notes-v1"
 const DEVICE_KEY = "notes-device-id"
 const SETTINGS_KEY = "notes-ai-settings"
-const REMEMBER_UNTIL_KEY = "auth-remember-until"
 
 type AiSettings = {
   geminiKey: string
@@ -164,7 +163,7 @@ function NoteApp() {
   const [memories, setMemories] = useState<any[]>([])
   const [memLoading, setMemLoading] = useState(false)
 
-  // Auth + remember gate
+  // Auth state
   useEffect(() => {
     let mounted = true
     supabase.auth.getSession().then(({ data }) => {
@@ -172,11 +171,6 @@ function NoteApp() {
       const s = data.session
       setSessionEmail(s?.user?.email ?? null)
       setAccessToken(s?.access_token ?? null)
-
-      const until = Number(localStorage.getItem(REMEMBER_UNTIL_KEY) || 0)
-      if (s && until && Date.now() > until) {
-        supabase.auth.signOut().catch(() => {})
-      }
     })
     const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
       setSessionEmail(session?.user?.email ?? null)
@@ -194,16 +188,22 @@ function NoteApp() {
     }
   }, [supabase, toast])
 
-  // If not logged in, redirect to /signup (signup-first UX)
-  useEffect(() => {
-    if (!sessionEmail) {
-      if (typeof window !== "undefined") {
-        window.location.href = "/signup"
-      }
+  async function signInWithEmail(email: string) {
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: true, emailRedirectTo: typeof window !== "undefined" ? window.location.origin : undefined },
+    })
+    if (error) {
+      toast({ title: "Sign-in failed", description: error.message, variant: "destructive" as any })
+    } else {
+      toast({ title: "Check your email", description: "We sent you a magic link." })
     }
-  }, [sessionEmail])
+  }
+  async function signOut() {
+    await supabase.auth.signOut()
+  }
 
-  // Device ID (memory scoping)
+  // Device ID (still used for memory extraction scoping)
   useEffect(() => {
     try {
       const existing = localStorage.getItem(DEVICE_KEY)
@@ -220,12 +220,28 @@ function NoteApp() {
     }
   }, [])
 
-  // While redirecting, render nothing
+  // Gate: require login to use the app
   if (!sessionEmail) {
-    return <div className="min-h-[60vh] grid place-items-center text-muted-foreground">Redirecting to sign up…</div>
+    return (
+      <div className="min-h-[70vh] flex items-center justify-center">
+        <div className="w-full max-w-md rounded-lg border p-6">
+          <div className="mb-4 flex items-center gap-2">
+            <LogIn className="h-5 w-5" />
+            <h1 className="text-lg font-semibold">Sign in to continue</h1>
+          </div>
+          <p className="mb-4 text-sm text-muted-foreground">
+            This app requires login. Enter your email to receive a magic link.
+          </p>
+          <EmailSignInForm onSubmit={signInWithEmail} />
+          <p className="mt-4 text-xs text-muted-foreground">
+            After signing in, you can create, edit, and sync your notes across devices.
+          </p>
+        </div>
+      </div>
+    )
   }
 
-  // Ensure a note is selected after login
+  // Ensure a note is selected when available (runs only after login due to above gate)
   useEffect(() => {
     const pool = notes.filter((n) => {
       const domainOk = domainView === "ai" ? !!n.aiGenerated : true
@@ -306,9 +322,93 @@ function NoteApp() {
     return pool
   }, [notes, statusView, domainView, query, sortKey, sortDir])
 
-  const signOut = useCallback(async () => {
-    await supabase.auth.signOut()
-  }, [supabase])
+  // CRUD and updates
+  const createNote = useCallback(() => {
+    const id = safeUUID()
+    const when = now()
+    const newNote: Note = {
+      id,
+      title: "Untitled",
+      content: "",
+      tags: [],
+      category: "",
+      aiGenerated: domainView === "ai" ? true : false,
+      pinned: false,
+      archived: false,
+      trashed: false,
+      createdAt: when,
+      updatedAt: when,
+    }
+    setNotes((prev) => [newNote, ...prev])
+    setSelectedId(id)
+    setStatusView("active")
+    setSidebarOpen(false)
+    queueMicrotask(() => toast({ title: "New note created" }))
+  }, [setNotes, toast, domainView])
+
+  const updateNote = useCallback(
+    (id: string, patch: Partial<Note>) => {
+      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, ...patch, updatedAt: patch.updatedAt ?? now() } : n)))
+    },
+    [setNotes]
+  )
+
+  const pinToggle = useCallback(
+    (n: Note) => {
+      updateNote(n.id, { pinned: !n.pinned })
+    },
+    [updateNote]
+  )
+
+  const archiveToggle = useCallback(
+    (n: Note) => {
+      if (n.trashed) return
+      const next = !n.archived
+      updateNote(n.id, { archived: next, pinned: next ? false : n.pinned })
+      if (next && statusView === "active") {
+        setSelectedId(null)
+      }
+    },
+    [statusView, updateNote]
+  )
+
+  const trashToggle = useCallback(
+    (n: Note) => {
+      const next = !n.trashed
+      updateNote(n.id, {
+        trashed: next,
+        archived: next ? false : n.archived,
+        pinned: next ? false : n.pinned,
+      })
+      if (next) setSelectedId(null)
+    },
+    [updateNote]
+  )
+
+  const deleteForever = useCallback(
+    async (n: Note) => {
+      setNotes((prev) => prev.filter((x) => x.id !== n.id))
+      if (selectedId === n.id) setSelectedId(null)
+      toast({ title: "Deleted permanently" })
+      try {
+        await fetch(`/api/sync?id=${encodeURIComponent(n.id)}`, {
+          method: "DELETE",
+          headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+        })
+      } catch {}
+    },
+    [setNotes, selectedId, toast, accessToken]
+  )
+
+  const restoreFromTrash = useCallback(
+    (n: Note) => {
+      updateNote(n.id, { trashed: false })
+      setStatusView("active")
+      setSelectedId(n.id)
+      toast({ title: "Note restored" })
+    },
+    [updateNote, toast]
+  )
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -336,7 +436,7 @@ function NoteApp() {
     return () => window.removeEventListener("keydown", handler)
   }, [createNote, toast, selectedNote])
 
-  // ---------- Cloud Sync ----------
+  // ---------- Cloud Sync (login required) ----------
   const pushAll = useCallback(async () => {
     if (!accessToken) return
     try {
@@ -428,94 +528,6 @@ function NoteApp() {
     return () => window.clearInterval(i)
   }, [setNotes, accessToken])
 
-  // CRUD and updates
-  const createNote = useCallback(() => {
-    const id = safeUUID()
-    const when = now()
-    const newNote: Note = {
-      id,
-      title: "Untitled",
-      content: "",
-      tags: [],
-      category: "",
-      aiGenerated: domainView === "ai" ? true : false,
-      pinned: false,
-      archived: false,
-      trashed: false,
-      createdAt: when,
-      updatedAt: when,
-    }
-    setNotes((prev) => [newNote, ...prev])
-    setSelectedId(id)
-    setStatusView("active")
-    setSidebarOpen(false)
-    queueMicrotask(() => toast({ title: "New note created" }))
-  }, [setNotes, toast, domainView])
-
-  const updateNote = useCallback(
-    (id: string, patch: Partial<Note>) => {
-      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, ...patch, updatedAt: patch.updatedAt ?? now() } : n)))
-    },
-    [setNotes]
-  )
-
-  const pinToggle = useCallback(
-    (n: Note) => {
-      updateNote(n.id, { pinned: !n.pinned })
-    },
-    [updateNote]
-  )
-
-  const archiveToggle = useCallback(
-    (n: Note) => {
-      if (n.trashed) return
-      const next = !n.archived
-      updateNote(n.id, { archived: next, pinned: next ? false : n.pinned })
-      if (next && statusView === "active") {
-        setSelectedId(null)
-      }
-    },
-    [statusView, updateNote]
-  )
-
-  const trashToggle = useCallback(
-    (n: Note) => {
-      const next = !n.trashed
-      updateNote(n.id, {
-        trashed: next,
-        archived: next ? false : n.archived,
-        pinned: next ? false : n.pinned,
-      })
-      if (next) setSelectedId(null)
-    },
-    [updateNote]
-  )
-
-  const deleteForever = useCallback(
-    async (n: Note) => {
-      setNotes((prev) => prev.filter((x) => x.id !== n.id))
-      if (selectedId === n.id) setSelectedId(null)
-      toast({ title: "Deleted permanently" })
-      try {
-        await fetch(`/api/sync?id=${encodeURIComponent(n.id)}`, {
-          method: "DELETE",
-          headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
-        })
-      } catch {}
-    },
-    [setNotes, selectedId, toast, accessToken]
-  )
-
-  const restoreFromTrash = useCallback(
-    (n: Note) => {
-      updateNote(n.id, { trashed: false })
-      setStatusView("active")
-      setSelectedId(n.id)
-      toast({ title: "Note restored" })
-    },
-    [updateNote, toast]
-  )
-
   // ---------- Manual AI Save ----------
   const [aiSaving, setAiSaving] = useState(false)
   const aiSave = useCallback(async () => {
@@ -591,7 +603,7 @@ function NoteApp() {
       }
       setNotes((prev) => [aiCopy, ...prev])
 
-      // Memories
+      // Memories from rewritten content (best effort; uses deviceId just to scope)
       if (deviceId) {
         fetch("/api/ai/extract-memory", {
           method: "POST",
@@ -605,6 +617,7 @@ function NoteApp() {
         }).catch(() => {})
       }
 
+      // Jump to AI tab
       setDomainView("ai")
       setStatusView("active")
       setSelectedId(aiId)
@@ -698,9 +711,11 @@ function NoteApp() {
     }
   }, [settings.geminiKey, searchQuery, notes, toast])
 
+  // ---------- UI (only rendered after login) ----------
   return (
     <div className="grid grid-rows-[auto_1fr] gap-3">
       <header className="flex flex-col gap-3">
+        {/* Top bar: domain/status, search, memory, settings, auth */}
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex rounded-lg border p-1">
@@ -1133,6 +1148,43 @@ function NoteApp() {
         </DialogContent>
       </Dialog>
     </div>
+  )
+}
+
+function EmailSignInForm({ onSubmit }: { onSubmit: (email: string) => void }) {
+  const [email, setEmail] = useState("")
+  const [pending, setPending] = useState(false)
+  return (
+    <form
+      onSubmit={async (e) => {
+        e.preventDefault()
+        if (!email.trim()) return
+        setPending(true)
+        try {
+          await onSubmit(email.trim())
+        } finally {
+          setPending(false)
+        }
+      }}
+      className="grid gap-3"
+    >
+      <div className="grid gap-2">
+        <Label htmlFor="email">Email</Label>
+        <Input
+          id="email"
+          type="email"
+          placeholder="you@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          required
+        />
+      </div>
+      <DialogFooter>
+        <Button type="submit" disabled={pending}>
+          {pending ? "Sending..." : "Send Magic Link"}
+        </Button>
+      </DialogFooter>
+    </form>
   )
 }
 

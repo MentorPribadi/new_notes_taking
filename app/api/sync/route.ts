@@ -6,6 +6,8 @@ type NoteWire = {
   title: string
   content: string
   tags: string[]
+  category?: string
+  aiGenerated?: boolean
   pinned: boolean
   archived: boolean
   trashed: boolean
@@ -31,22 +33,38 @@ function isMissingTableError(err: any) {
     msg.includes("could not find the table") ||
     details.includes("notes") ||
     hint.includes("notes") ||
-    err?.code === "42P01" // undefined_table (Postgres)
+    err?.code === "42P01"
   )
 }
 
+async function getAuthUserId(req: Request) {
+  const auth = req.headers.get("authorization") || ""
+  const match = auth.match(/Bearer\s+(.+)/i)
+  if (!match) return null
+  const token = match[1]
+  try {
+    const supabase = getServerSupabase()
+    const { data, error } = await supabase.auth.getUser(token)
+    if (error) return null
+    return data.user?.id ?? null
+  } catch {
+    return null
+  }
+}
+
+// Require login for ALL operations. Device-based sync is disabled.
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url)
-    const deviceId = url.searchParams.get("deviceId")
     const since = url.searchParams.get("since")
+    const userId = await getAuthUserId(req)
 
-    if (!deviceId) {
-      return NextResponse.json({ error: "Missing deviceId" }, { status: 400 })
+    if (!userId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
     const supabase = getServerSupabase()
-    let query = supabase.from("notes").select("*").eq("device_id", deviceId)
+    let query = supabase.from("notes").select("*").eq("user_id", userId)
 
     if (since && /^\d+$/.test(since)) {
       const iso = toISO(Number(since))
@@ -57,7 +75,6 @@ export async function GET(req: Request) {
 
     if (error) {
       if (isMissingTableError(error)) {
-        // Treat as "no data yet" so the app works offline until migration runs
         return NextResponse.json({ notes: [], hint: "missing_table" })
       }
       console.error("GET /api/sync error", error)
@@ -70,6 +87,8 @@ export async function GET(req: Request) {
         title: r.title ?? "",
         content: r.content ?? "",
         tags: Array.isArray(r.tags) ? r.tags : [],
+        category: r.category ?? "",
+        aiGenerated: !!r.ai_generated,
         pinned: !!r.pinned,
         archived: !!r.archived,
         trashed: !!r.trashed,
@@ -86,13 +105,14 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { deviceId?: string; notes?: NoteWire[] }
-    const deviceId = body.deviceId
+    const userId = await getAuthUserId(req)
+    if (!userId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    const body = (await req.json()) as { notes?: NoteWire[] }
     const notes = body.notes ?? []
 
-    if (!deviceId) {
-      return NextResponse.json({ error: "Missing deviceId" }, { status: 400 })
-    }
     if (!Array.isArray(notes)) {
       return NextResponse.json({ error: "Invalid notes payload" }, { status: 400 })
     }
@@ -100,10 +120,13 @@ export async function POST(req: Request) {
     const supabase = getServerSupabase()
     const rows = notes.map((n) => ({
       id: n.id,
-      device_id: deviceId,
+      user_id: userId,
+      device_id: null,
       title: n.title ?? "",
       content: n.content ?? "",
       tags: Array.isArray(n.tags) ? n.tags : [],
+      category: n.category ?? "",
+      ai_generated: !!n.aiGenerated,
       pinned: !!n.pinned,
       archived: !!n.archived,
       trashed: !!n.trashed,
@@ -115,7 +138,6 @@ export async function POST(req: Request) {
 
     if (error) {
       if (isMissingTableError(error)) {
-        // Table isn't created yet; respond OK so UI doesn't error while offline
         return NextResponse.json({ ok: false, count: 0, hint: "missing_table" })
       }
       console.error("POST /api/sync error", error)
@@ -132,19 +154,25 @@ export async function POST(req: Request) {
 export async function DELETE(req: Request) {
   try {
     const url = new URL(req.url)
-    const deviceId = url.searchParams.get("deviceId")
     const id = url.searchParams.get("id")
+    const userId = await getAuthUserId(req)
 
-    if (!deviceId || !id) {
-      return NextResponse.json({ error: "Missing deviceId or id" }, { status: 400 })
+    if (!userId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+    if (!id) {
+      return NextResponse.json({ error: "Missing id" }, { status: 400 })
     }
 
     const supabase = getServerSupabase()
-    const { error } = await supabase.from("notes").delete().eq("device_id", deviceId).eq("id", id)
+    const { error } = await supabase
+      .from("notes")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", userId)
 
     if (error) {
       if (isMissingTableError(error)) {
-        // Nothing to delete yet because table doesn't exist
         return NextResponse.json({ ok: false, hint: "missing_table" })
       }
       console.error("DELETE /api/sync error", error)

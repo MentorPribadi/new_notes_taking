@@ -52,7 +52,7 @@ async function getAuthUserId(req: Request) {
   }
 }
 
-// Require login for ALL operations. Device-based sync is disabled.
+// Require login for ALL operations (password flow, no device fallback)
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url)
@@ -112,7 +112,6 @@ export async function POST(req: Request) {
 
     const body = (await req.json()) as { notes?: NoteWire[] }
     const notes = body.notes ?? []
-
     if (!Array.isArray(notes)) {
       return NextResponse.json({ error: "Invalid notes payload" }, { status: 400 })
     }
@@ -165,11 +164,7 @@ export async function DELETE(req: Request) {
     }
 
     const supabase = getServerSupabase()
-    const { error } = await supabase
-      .from("notes")
-      .delete()
-      .eq("id", id)
-      .eq("user_id", userId)
+    const { error } = await supabase.from("notes").delete().eq("id", id).eq("user_id", userId)
 
     if (error) {
       if (isMissingTableError(error)) {
